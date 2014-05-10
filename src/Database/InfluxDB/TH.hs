@@ -93,14 +93,14 @@ fromSeriesDataBody opts tyName tyVars con = do
   case con of
     RecC conName vars -> instanceD
       (mapM tyVarToPred tyVars)
-      [t| FromSeriesData $(conT tyName) |]
+      [t| FromRow $(conT tyName) |]
       [deriveDec conName vars]
     _ -> fail $ "Expected a record, but got " ++ show con
   where
     tyVarToPred tv = case tv of
       PlainTV name -> classP ''FromValue [varT name]
       KindedTV name _ -> classP ''FromValue [varT name]
-    deriveDec conName vars = funD 'parseSeriesData
+    deriveDec conName vars = funD 'parseRow
       [ clause [] (normalB deriveBody) []
       ]
       where

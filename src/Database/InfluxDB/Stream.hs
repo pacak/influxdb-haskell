@@ -1,6 +1,6 @@
 {-# LANGUAGE BangPatterns #-}
 module Database.InfluxDB.Stream where
-import Prelude hiding (mapM)
+import Prelude hiding (mapM, concatMap)
 
 -- | Effectful stream
 data Stream m a
@@ -39,3 +39,12 @@ fold' f = loop
         !b <- f z a
         stream' <- nextStream
         loop b stream'
+
+append :: Stream m a -> Stream m a -> m (Stream m a)
+append = undefined
+
+concatMap :: Monad m => (a -> [b]) -> Stream m a -> m (Stream m b)
+concatMap _ Done = return Done
+concatMap f (Yield a ma) = do
+  undefined
+

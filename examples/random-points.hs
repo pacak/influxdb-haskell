@@ -1,9 +1,10 @@
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TypeSynonymInstances #-}
 {-# LANGUAGE ViewPatterns #-}
-{-# LANGUAGE TemplateHaskell #-}
 import Control.Applicative
 import Control.Exception as E
 import Control.Monad
@@ -30,7 +31,7 @@ main = do
   [read -> (numPoints :: Int), read -> (batches :: Int)] <- getArgs
   hSetBuffering stdout NoBuffering
   HC.withManager managerSettings $ \manager -> do
-    config <- newConfig manager
+    config <- newConfig rootCreds [localServer] manager
 
     let db = "ctx"
     dropDatabase config db
@@ -53,11 +54,11 @@ main = do
     result <- query config db "select count(value) from ct1;"
     case result of
       [] -> putStrLn "Empty series"
-      series:_ -> do
-        print $ seriesColumns series
-        print $ seriesPoints series
+      Series {seriesData}:_ -> do
+        print $ seriesDataColumns seriesData
+        print $ seriesDataPoints seriesData
     -- Streaming output
-    queryChunked config db "select * from ct1;" $ S.fold step ()
+    -- queryChunked config db "select * from ct1;" $ S.fold step ()
   where
     step _ series = do
       case fromSeriesData series of

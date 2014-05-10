@@ -1,23 +1,37 @@
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE DeriveDataTypeable #-}
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TemplateHaskell #-}
+{-# LANGUAGE TypeSynonymInstances #-}
+
+{-# LANGUAGE OverlappingInstances #-}
 module Database.InfluxDB.Types
   ( -- * Series, columns and data points
-    Series(..)
-  , seriesColumns
-  , seriesPoints
+    Series(..), seriesColumns, seriesPoints
   , SeriesData(..)
   , Column
   , Value(..)
+
+  , ToSeriesData(..), toSeriesData
+
+  , FromRow(..), fromSeriesData
+  , withValues, (.:), (.:?), (.!=)
+
+  , FromValue(..), fromValue
+
+  , Parser, ValueParser, runParser, typeMismatch
 
   -- * Data types for HTTP API
   , Credentials(..)
   , Server(..)
   , Database(..)
   , ScheduledDelete(..)
+  , ContinuousQuery(..)
   , User(..)
   , Admin(..)
   , Ping(..)
@@ -32,18 +46,27 @@ module Database.InfluxDB.Types
   , failover
   ) where
 
-import Control.Applicative (empty)
+import Control.Applicative
+import Control.Monad.Reader
 import Data.Data (Data)
 import Data.IORef
-import Data.Int (Int64)
+import Data.Int
+import Data.Map (Map)
+import Data.Maybe (fromMaybe)
+import Data.Proxy
 import Data.Sequence (Seq, ViewL(..), (|>))
 import Data.Text (Text)
+import Data.Tuple (swap)
 import Data.Typeable (Typeable)
 import Data.Vector (Vector)
+import Data.Word
+import qualified Data.Map as Map
 import qualified Data.Sequence as Seq
+import qualified Data.Text as T
+import qualified Data.Text.Lazy as TL
+import qualified Data.Vector as V
 
 import Control.Retry (RetrySettings(..), limitedRetries)
-import Data.Aeson ((.=), (.:))
 import Data.Aeson.TH
 import qualified Data.Aeson as A
 
@@ -72,42 +95,75 @@ atomicModifyIORef' ref f = do
 
 -- | A series consists of name, columns and points. The columns and points are
 -- expressed in a separate type 'SeriesData'.
-data Series = Series
+data Series a = Series
   { seriesName :: {-# UNPACK #-} !Text
   -- ^ Series name
-  , seriesData :: {-# UNPACK #-} !SeriesData
+  , seriesData :: !a
   -- ^ Columns and data points in the series
-  }
+  } deriving (Eq, Show)
 
 -- | Convenient accessor for columns.
-seriesColumns :: Series -> Vector Column
-seriesColumns = seriesDataColumns . seriesData
+seriesColumns
+  :: ToSeriesData a
+  => Series a
+  -> Vector Column
+seriesColumns = seriesDataColumns . toSeriesData . seriesData
 
 -- | Convenient accessor for points.
-seriesPoints :: Series -> [Vector Value]
-seriesPoints = seriesDataPoints . seriesData
+seriesPoints
+  :: ToSeriesData a
+  => Series a
+  -> [Vector Value]
+seriesPoints = seriesDataPoints . toSeriesData . seriesData
 
-instance A.ToJSON Series where
+instance A.ToJSON (Series SeriesData) where
   toJSON Series {..} = A.object
-    [ "name" .= seriesName
-    , "columns" .= seriesDataColumns
-    , "points" .= seriesDataPoints
+    [ "name" A..= seriesName
+    , "columns" A..= seriesDataColumns
+    , "points" A..= seriesDataPoints
     ]
     where
       SeriesData {..} = seriesData
 
-instance A.FromJSON Series where
+instance ToSeriesData a => A.ToJSON (Series a) where
+  toJSON Series {..} = A.object
+    [ "name" A..= seriesName
+    , "columns" A..= seriesDataColumns
+    , "points" A..= seriesDataPoints
+    ]
+    where
+      SeriesData {..} = toSeriesData seriesData
+
+instance A.FromJSON (Series SeriesData) where
   parseJSON (A.Object v) = do
-    name <- v .: "name"
-    columns <- v .: "columns"
-    points <- v .: "points"
-    return Series
-      { seriesName = name
-      , seriesData = SeriesData
+    seriesName <- v A..: "name"
+    columns <- v A..: "columns"
+    points <- v A..: "points"
+    let seriesData = SeriesData
           { seriesDataColumns = columns
           , seriesDataPoints = points
           }
+    return Series
+      { seriesName
+      , seriesData
       }
+  parseJSON _ = empty
+
+instance FromRow a => A.FromJSON (Series [a]) where
+  parseJSON (A.Object v) = do
+    seriesName <- v A..: "name"
+    columns <- v A..: "columns"
+    points <- v A..: "points"
+    let seriesData = SeriesData
+          { seriesDataColumns = columns
+          , seriesDataPoints = points
+          }
+    case fromSeriesData seriesData of
+      Left reason -> fail reason
+      Right xs -> return Series
+        { seriesName
+        , seriesData = xs
+        }
   parseJSON _ = empty
 
 -- | 'SeriesData' consists of columns and points.
@@ -156,6 +212,212 @@ instance A.FromJSON Value where
 
 -----------------------------------------------------------
 
+-- | A type that can be converted to a 'SeriesData'. A typical implementation is
+-- as follows.
+--
+-- > import qualified Data.Vector as V
+-- >
+-- > data Event = Event Text EventType
+-- > data EventType = Login | Logout
+-- >
+-- > instance ToSeriesData Event where
+-- >   toSeriesColumn _ = V.fromList ["user", "type"]
+-- >   toSeriesPoints (Event user ty) = V.fromList [toValue user, toValue ty]
+-- >
+-- > instance ToValue EventType
+class ToSeriesData a where
+  -- | Column names. You can safely ignore the proxy agument.
+  toSeriesColumns :: Proxy a -> Vector Column
+  -- | Data points in a record.
+  toSeriesPoints :: a -> Vector Value
+
+toSeriesData :: forall a. ToSeriesData a => a -> SeriesData
+toSeriesData a = SeriesData
+  { seriesDataColumns = toSeriesColumns (Proxy :: Proxy a)
+  , seriesDataPoints = [toSeriesPoints a]
+  }
+
+-----------------------------------------------------------
+
+-- | A type that can be converted from a 'SeriesData'. A typical implementation
+-- is as follows.
+--
+-- > import Control.Applicative ((<$>), (<*>))
+-- > import qualified Data.Vector as V
+-- >
+-- > data Event = Event Text EventType
+-- > data EventType = Login | Logout
+-- >
+-- > instance FromSeriesData Event where
+-- >   parseSeriesData = withValues $ \values -> Event
+-- >     <$> values .: "user"
+-- >     <*> values .: "type"
+-- >
+-- > instance FromValue EventType
+parseSeriesData :: FromRow a => SeriesData -> Parser [a]
+parseSeriesData SeriesData {..} =
+  mapM (parseRow seriesDataColumns) seriesDataPoints
+
+-- | Converte a value from a 'SeriesData', failing if the types do not match.
+fromSeriesData :: FromRow a => SeriesData -> Either String [a]
+fromSeriesData = runParser . parseSeriesData
+
+class FromRow a where
+  parseRow :: Vector Column -> Vector Value -> Parser a
+
+fromRow :: FromRow a => Vector Column -> Vector Value -> Either String a
+fromRow = (runParser .) . parseRow
+
+-- | Helper function to define 'parseSeriesData' from 'ValueParser's.
+withValues
+  :: (Vector Value -> ValueParser a)
+  -> Vector Column -> Vector Value -> Parser a
+withValues f columns values =
+  runReaderT m $ Map.fromList $ map swap $ V.toList $ V.indexed columns
+  where
+    ValueParser m = f values
+
+-- | Retrieve the value associated with the given column. The result is 'empty'
+-- if the column is not present or the value cannot be converted to the desired
+-- type.
+(.:) :: FromValue a => Vector Value -> Column -> ValueParser a
+values .: column = do
+  found <- asks $ Map.lookup column
+  case found of
+    Nothing -> fail $ "No such column: " ++ T.unpack column
+    Just idx -> do
+      value <- V.indexM values idx
+      liftParser $ parseValue value
+
+-- | Retrieve the value associated with the given column. The result is
+-- 'Nothing' if the column is not present or the value cannot be converted to
+-- the desired type.
+(.:?) :: FromValue a => Vector Value -> Column -> ValueParser (Maybe a)
+values .:? column = do
+  found <- asks $ Map.lookup column
+  case found of
+    Nothing -> return Nothing
+    Just idx ->
+      case values V.!? idx of
+        Nothing -> return Nothing
+        Just value -> liftParser $ parseValue value
+
+-- | Helper for use in combination with '.:?' to provide default values for
+-- optional columns.
+(.!=) :: Parser (Maybe a) -> a -> Parser a
+p .!= def = fromMaybe def <$> p
+
+newtype Parser a = Parser
+  { runParser :: Either String a
+  } deriving (Functor, Applicative, Monad)
+
+type ColumnIndex = Map Column Int
+
+newtype ValueParser a = ValueParser (ReaderT ColumnIndex Parser a)
+  deriving (Functor, Applicative, Monad, MonadReader ColumnIndex)
+
+liftParser :: Parser a -> ValueParser a
+liftParser = ValueParser . ReaderT . const
+
+
+-- | A type that can be converted from a 'Value'.
+class FromValue a where
+  parseValue :: Value -> Parser a
+
+-- | Converte a value from a 'Value', failing if the types do not match.
+fromValue :: FromValue a => Value -> Either String a
+fromValue = runParser . parseValue
+
+instance FromValue Value where
+  parseValue = return
+
+instance FromValue Bool where
+  parseValue (Bool b) = return b
+  parseValue v = typeMismatch "Bool" v
+
+instance FromValue a => FromValue (Maybe a) where
+  parseValue Null = return Nothing
+  parseValue v = Just <$> parseValue v
+
+instance FromValue Int where
+  parseValue (Int n) = return $ fromIntegral n
+  parseValue v = typeMismatch "Int" v
+
+instance FromValue Int8 where
+  parseValue (Int n)
+    | n <= fromIntegral (maxBound :: Int8) = return $ fromIntegral n
+    | otherwise = fail $ "Larger than the maximum Int8: " ++ show n
+  parseValue v = typeMismatch "Int8" v
+
+instance FromValue Int16 where
+  parseValue (Int n)
+    | n <= fromIntegral (maxBound :: Int16) = return $ fromIntegral n
+    | otherwise = fail $ "Larger than the maximum Int16: " ++ show n
+  parseValue v = typeMismatch "Int16" v
+
+instance FromValue Int32 where
+  parseValue (Int n)
+    | n <= fromIntegral (maxBound :: Int32) = return $ fromIntegral n
+    | otherwise = fail $ "Larger than the maximum Int32: " ++ show n
+  parseValue v = typeMismatch "Int32" v
+
+instance FromValue Int64 where
+  parseValue (Int n)
+    | n <= fromIntegral (maxBound :: Int64) = return $ fromIntegral n
+    | otherwise = fail $ "Larger than the maximum Int64: " ++ show n
+  parseValue v = typeMismatch "Int64" v
+
+instance FromValue Word8 where
+  parseValue (Int n)
+    | n <= fromIntegral (maxBound :: Word8) = return $ fromIntegral n
+    | otherwise = fail $ "Larger than the maximum Word8: " ++ show n
+  parseValue v = typeMismatch "Word8" v
+
+instance FromValue Word16 where
+  parseValue (Int n)
+    | n <= fromIntegral (maxBound :: Word16) = return $ fromIntegral n
+    | otherwise = fail $ "Larger than the maximum Word16: " ++ show n
+  parseValue v = typeMismatch "Word16" v
+
+instance FromValue Word32 where
+  parseValue (Int n)
+    | n <= fromIntegral (maxBound :: Word32) = return $ fromIntegral n
+    | otherwise = fail $ "Larger than the maximum Word32: " ++ show n
+  parseValue v = typeMismatch "Word32" v
+
+instance FromValue Double where
+  parseValue (Float d) = return d
+  parseValue v = typeMismatch "Float" v
+
+instance FromValue T.Text where
+  parseValue (String xs) = return xs
+  parseValue v = typeMismatch "Text" v
+
+instance FromValue TL.Text where
+  parseValue (String xs) = return $ TL.fromStrict xs
+  parseValue v = typeMismatch "lazy Text" v
+
+instance FromValue String where
+  parseValue (String xs) = return $ T.unpack xs
+  parseValue v = typeMismatch "String" v
+
+typeMismatch
+  :: String
+  -> Value
+  -> Parser a
+typeMismatch expected actual = fail $
+  "when expecting a " ++ expected ++
+  ", encountered " ++ name ++ " instead"
+  where
+    name = case actual of
+      Int _ -> "Int"
+      Float _ -> "Float"
+      String _ -> "String"
+      Bool _ -> "Bool"
+      Null -> "Null"
+
+-----------------------------------------------------------
+
 -- | User credentials.
 data Credentials = Credentials
   { credsUser :: !Text
@@ -187,6 +449,11 @@ newtype Database = Database
 
 newtype ScheduledDelete = ScheduledDelete
   { scheduledDeleteId :: Int
+  } deriving Show
+
+data ContinuousQuery = ContinuousQuery
+  { continuousQueryId :: !Int
+  , continuousQueryQuery :: !Text
   } deriving Show
 
 -- | User
@@ -256,3 +523,4 @@ deriveFromJSON (stripPrefixOptions "database") ''Database
 deriveFromJSON (stripPrefixOptions "admin") ''Admin
 deriveFromJSON (stripPrefixOptions "user") ''User
 deriveFromJSON (stripPrefixOptions "ping") ''Ping
+deriveFromJSON (stripPrefixOptions "continuousQuery") ''ContinuousQuery

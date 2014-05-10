@@ -1,11 +1,12 @@
 {-# LANGUAGE CPP #-}
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 module Database.InfluxDB.Http
-  ( Config(..)
+  ( Config(..), newConfig
   , Credentials(..), rootCreds
   , Server(..), localServer
   , TimePrecision(..)
@@ -37,6 +38,11 @@ module Database.InfluxDB.Http
   , listDatabases
   , createDatabase
   , dropDatabase
+
+  -- ** Continuous queries
+  , listContinuousQueries
+  , createContinuousQuery
+  , deleteContinuousQuery
 
   -- ** Security
   -- *** Cluster admin
@@ -106,6 +112,16 @@ data Config = Config
   , configHttpManager :: !HC.Manager
   }
 
+newConfig :: Credentials -> [Server] -> HC.Manager -> IO Config
+newConfig _ [] _ = fail "newConfig: At least one server must be given"
+newConfig creds (server:servers) manager = do
+  pool <- newServerPool server servers
+  return Config
+    { configCreds = creds
+    , configServerPool = pool
+    , configHttpManager = manager
+    }
+
 -- | Default credentials.
 rootCreds :: Credentials
 rootCreds = Credentials
@@ -167,6 +183,7 @@ postGeneric Config {..} databaseName timePrec write = do
     configHttpManager
   return a
   where
+    makeRequest :: [Series SeriesData] -> HC.Request
     makeRequest series = def
       { HC.method = "POST"
       , HC.requestBody = HC.RequestBodyLBS $ AE.encode series
@@ -184,10 +201,10 @@ postGeneric Config {..} databaseName timePrec write = do
 
 -- | Monad transformer to batch up multiple writes of series to speed up
 -- insertions.
-newtype SeriesT m a = SeriesT (WriterT (DList Series) m a)
+newtype SeriesT m a = SeriesT (WriterT (DList (Series SeriesData)) m a)
   deriving
     ( Functor, Applicative, Monad, MonadIO, MonadTrans
-    , MonadWriter (DList Series)
+    , MonadWriter (DList (Series SeriesData))
     )
 
 -- | Monad transformer to batch up multiple writes of points to speed up
@@ -198,7 +215,7 @@ newtype PointT p m a = PointT (WriterT (DList (Vector Value)) m a)
     , MonadWriter (DList (Vector Value))
     )
 
-runSeriesT :: Monad m => SeriesT m a -> m (a, [Series])
+runSeriesT :: Monad m => SeriesT m a -> m (a, [Series SeriesData])
 runSeriesT (SeriesT w) = do
   (a, series) <- runWriterT w
   return (a, DL.toList series)
@@ -292,18 +309,17 @@ deleteSeries Config {..} databaseName seriesName =
 -- The query format is specified in the
 -- <http://influxdb.org/docs/query_language/ InfluxDB Query Language>.
 query
-  :: FromSeries a
+  :: A.FromJSON (Series a)
   => Config
   -> Text -- ^ Database name
   -> Text -- ^ Query text
-  -> IO [a]
+  -> IO [Series a]
 query Config {..} databaseName q = do
   response <- httpLbsWithRetry configServerPool request configHttpManager
-  case A.decode (HC.responseBody response) of
-    Nothing -> fail $ show response
-    Just xs -> case mapM fromSeries xs of
-      Left reason -> fail reason
-      Right ys -> return ys
+  let body = HC.responseBody response
+  case A.eitherDecode body of
+    Right series -> return series
+    Left reason -> fail $ "query: " ++ reason
   where
     request = def
       { HC.path = escapeString $ printf "/db/%s/series"
@@ -334,30 +350,27 @@ responseStream body = demandPayload $ \payload ->
 
 -- | Query a specified database like 'query' but in a streaming fashion.
 queryChunked
-  :: FromSeries a
+  :: A.FromJSON (Series a)
   => Config
   -> Text -- ^ Database name
   -> Text -- ^ Query text
   -> (Stream IO a -> IO b)
   -- ^ Action to handle the resulting stream of series
   -> IO b
-queryChunked Config {..} databaseName q f =
-  withPool configServerPool request $ \request' ->
-    HC.withResponse request' configHttpManager $
-      responseStream . HC.responseBody >=> S.mapM parse >=> f
-  where
-    parse series = case fromSeries series of
-      Left reason -> fail reason
-      Right a -> return a
-    request = def
-      { HC.path = escapeString $ printf "/db/%s/series"
-          (T.unpack databaseName)
-      , HC.queryString = escapeString $ printf "u=%s&p=%s&q=%s&chunked=true"
-          (T.unpack credsUser)
-          (T.unpack credsPassword)
-          (T.unpack q)
-      }
-    Credentials {..} = configCreds
+queryChunked Config {..} databaseName q f = undefined
+  --withPool configServerPool request $ \request' ->
+  --  HC.withResponse request' configHttpManager $
+  --    responseStream . HC.responseBody >=> S.concatMap seriesData >=> f
+  --where
+  --  request = def
+  --    { HC.path = escapeString $ printf "/db/%s/series"
+  --        (T.unpack databaseName)
+  --    , HC.queryString = escapeString $ printf "u=%s&p=%s&q=%s&chunked=true"
+  --        (T.unpack credsUser)
+  --        (T.unpack credsPassword)
+  --        (T.unpack q)
+  --    }
+  --  Credentials {..} = configCreds
 
 -----------------------------------------------------------
 -- Administration & Security
@@ -367,7 +380,7 @@ listDatabases :: Config -> IO [Database]
 listDatabases Config {..} = do
   response <- httpLbsWithRetry configServerPool makeRequest configHttpManager
   case A.decode (HC.responseBody response) of
-    Nothing -> fail $ show response
+    Nothing -> fail $ "Failed to decode: " ++ show response
     Just xs -> return xs
   where
     makeRequest = def
@@ -412,6 +425,31 @@ dropDatabase Config {..} databaseName =
           (T.unpack credsPassword)
       }
     Credentials {..} = configCreds
+
+listContinuousQueries
+  :: Config
+  -> Text -- ^ Database name
+  -> IO [ContinuousQuery]
+listContinuousQueries Config {..} databaseName = do
+  response <- httpLbsWithRetry configServerPool makeRequest configHttpManager
+  case A.decode (HC.responseBody response) of
+    Nothing -> fail $ "Failed to decode: " ++ show response
+    Just xs -> return xs
+  where
+    makeRequest = def
+      { HC.path = escapeString $ printf "/db/%s/continuous_queries"
+          (T.unpack databaseName)
+      , HC.queryString = escapeString $ printf "u=%s&p=%s"
+          (T.unpack credsUser)
+          (T.unpack credsPassword)
+      }
+    Credentials {..} = configCreds
+
+createContinuousQuery = undefined
+
+
+deleteContinuousQuery = undefined
+
 
 -- | List cluster administrators.
 listClusterAdmins :: Config -> IO [Admin]
@@ -517,7 +555,7 @@ listDatabaseUsers
 listDatabaseUsers Config {..} database = do
   response <- httpLbsWithRetry configServerPool makeRequest configHttpManager
   case A.decode (HC.responseBody response) of
-    Nothing -> fail $ show response
+    Nothing -> fail $ "Failed to decode: " ++ show response
     Just xs -> return xs
   where
     makeRequest = def

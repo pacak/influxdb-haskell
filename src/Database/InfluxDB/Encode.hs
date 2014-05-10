@@ -1,5 +1,4 @@
 {-# LANGUAGE FlexibleInstances #-}
-{-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeSynonymInstances #-}
 module Database.InfluxDB.Encode
   ( ToSeries(..)
@@ -7,8 +6,6 @@ module Database.InfluxDB.Encode
   , ToValue(..)
   ) where
 import Data.Int (Int8, Int16, Int32, Int64)
-import Data.Proxy
-import Data.Vector (Vector)
 import Data.Word (Word8, Word16, Word32)
 import qualified Data.Text as T
 import qualified Data.Text.Lazy as TL
@@ -17,32 +14,7 @@ import Database.InfluxDB.Types
 
 -- | A type that can be converted to a 'Series'.
 class ToSeries a where
-  toSeries :: a -> Series
-
--- | A type that can be converted to a 'SeriesData'. A typical implementation is
--- as follows.
---
--- > import qualified Data.Vector as V
--- >
--- > data Event = Event Text EventType
--- > data EventType = Login | Logout
--- >
--- > instance ToSeriesData Event where
--- >   toSeriesColumn _ = V.fromList ["user", "type"]
--- >   toSeriesPoints (Event user ty) = V.fromList [toValue user, toValue ty]
--- >
--- > instance ToValue EventType
-class ToSeriesData a where
-  -- | Column names. You can safely ignore the proxy agument.
-  toSeriesColumns :: Proxy a -> Vector Column
-  -- | Data points.
-  toSeriesPoints :: a -> Vector Value
-
-toSeriesData :: forall a. ToSeriesData a => a -> SeriesData
-toSeriesData a = SeriesData
-  { seriesDataColumns = toSeriesColumns (Proxy :: Proxy a)
-  , seriesDataPoints = [toSeriesPoints a]
-  }
+  toSeries :: a -> Series a
 
 -- | A type that can be stored in InfluxDB.
 class ToValue a where

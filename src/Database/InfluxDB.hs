@@ -11,7 +11,7 @@ module Database.InfluxDB
 
   -- ** Decoding
   , FromSeries(..), fromSeries
-  , FromSeriesData(..), fromSeriesData
+  , FromRow(..), fromSeriesData
   , FromValue(..), fromValue
 
   , withValues, (.:), (.:?), (.!=)
@@ -19,7 +19,7 @@ module Database.InfluxDB
 
   -- * HTTP API
   -- ** Data types
-  , Config(..)
+  , Config(..), newConfig
   , Credentials(..), rootCreds
   , TimePrecision(..)
   , Server(..), localServer
@@ -56,6 +56,11 @@ module Database.InfluxDB
   , listDatabases
   , createDatabase
   , dropDatabase
+
+  -- *** Continuous queries
+  , listContinuousQueries
+  , createContinuousQuery
+  , deleteContinuousQuery
 
   -- *** Security
   -- **** Cluster admin
